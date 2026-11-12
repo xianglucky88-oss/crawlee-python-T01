@@ -171,6 +171,8 @@ The <ApiLink to="class/RequestManagerTandem">`RequestManagerTandem`</ApiLink> cl
 
 Under the hood, <ApiLink to="class/RequestManagerTandem">`RequestManagerTandem`</ApiLink> checks whether the read-only loader still has pending requests. If so, each new request from the loader is transferred to the manager. Any newly added or reclaimed requests go directly to the manager side.
 
+A request is marked as handled in the read-only loader only after the manager write succeeds. If that write fails transiently, the request stays owned by the loader, is retried on the next fetch, and is redelivered after a restart rather than dropped; successful transfers remain deduplicated, so each request is still processed at most once.
+
 ### Request list with request queue
 
 This section describes the combination of the <ApiLink to="class/RequestList">`RequestList`</ApiLink> and <ApiLink to="class/RequestQueue">`RequestQueue`</ApiLink> classes. This setup is particularly useful when you have a static list of URLs that you want to crawl, but also need to handle dynamic requests discovered during the crawl process. The <ApiLink to="class/RequestManagerTandem">`RequestManagerTandem`</ApiLink> class facilitates this combination, with the <ApiLink to="class/RequestLoader#to_tandem">`RequestLoader.to_tandem`</ApiLink> method available as a convenient shortcut. Requests from the <ApiLink to="class/RequestList">`RequestList`</ApiLink> are processed first by being enqueued into the default <ApiLink to="class/RequestQueue">`RequestQueue`</ApiLink>, which handles persistence and retries for failed requests.

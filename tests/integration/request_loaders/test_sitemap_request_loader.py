@@ -4,7 +4,10 @@ import base64
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+from crawlee import service_locator
+from crawlee.request_loaders import RequestManagerTandem
 from crawlee.request_loaders._sitemap_request_loader import SitemapRequestLoader
+from crawlee.storages import RequestQueue
 from tests._utils import (
     get_basic_results,
     get_basic_sitemap,
@@ -14,9 +17,10 @@ from tests._utils import (
 if TYPE_CHECKING:
     from yarl import URL
 
-    from crawlee import RequestOptions, RequestTransformAction
+    from crawlee import Request, RequestOptions, RequestTransformAction
     from crawlee._types import JsonSerializable
     from crawlee.http_clients._base import HttpClient
+    from crawlee.storage_clients.models import ProcessedRequest
     from crawlee.storages import KeyValueStore
 
 
@@ -255,10 +259,11 @@ async def test_sitemap_loader_to_tandem(
     assert await request_manager.is_finished()
 
 
-async def test_sitemap_loader_to_tandem_with_request_dropped(
+async def test_sitemap_loader_to_tandem_recovers_from_transient_write_failure(
     server_url: URL,
     http_client: HttpClient,
 ) -> None:
+    """A transient target write failure neither loses the request nor marks it handled in the loader."""
     sitemap_url = (server_url / 'sitemap.xml').with_query(
         base64=encode_base64(get_basic_sitemap(url=server_url).encode())
     )
@@ -270,20 +275,139 @@ async def test_sitemap_loader_to_tandem_with_request_dropped(
     )
     request_manager = await sitemap_loader.to_tandem()
 
-    with patch.object(
-        request_manager._read_write_manager, 'add_request', side_effect=Exception('Failed to add request')
-    ):
-        while not await sitemap_loader.is_finished():
-            request = await request_manager.fetch_next_request()
+    real_add_request = request_manager._read_write_manager.add_request
+    flaky_calls = 0
 
+    async def flaky_add_request(request: Request, *, forefront: bool = False) -> ProcessedRequest | None:
+        # Fail the first migration attempt of every request, then let the retry through.
+        nonlocal flaky_calls
+        flaky_calls += 1
+        if flaky_calls % 2 == 1:
+            raise RuntimeError('Failed to add request')
+        return await real_add_request(request, forefront=forefront)
+
+    with patch.object(request_manager._read_write_manager, 'add_request', side_effect=flaky_add_request):
+        processed: list[str] = []
+        while not await request_manager.is_finished():
+            request = await request_manager.fetch_next_request()
             if request:
+                processed.append(request.url)
                 await request_manager.mark_request_as_handled(request)
 
-        assert await sitemap_loader.is_empty()
-        assert await sitemap_loader.is_finished()
+    expected = get_basic_results(server_url)
+    assert sorted(processed) == sorted(expected)
+    assert len(processed) == len(set(processed))
 
-        assert await request_manager.is_empty()
-        assert await request_manager.is_finished()
+    assert await sitemap_loader.is_empty()
+    assert await sitemap_loader.is_finished()
+    assert await request_manager.is_empty()
+    assert await request_manager.is_finished()
+
+
+async def test_sitemap_loader_to_tandem_restart_after_failed_migration(
+    server_url: URL,
+    http_client: HttpClient,
+) -> None:
+    """A request whose target write failed is redelivered from the persisted loader state after a restart."""
+    sitemap_url = (server_url / 'sitemap.xml').with_query(
+        base64=encode_base64(get_basic_sitemap(url=server_url).encode())
+    )
+    persist_key = 'tandem_failed_migration_recovery'
+
+    sitemap_loader = SitemapRequestLoader(
+        [str(sitemap_url)],
+        http_client=http_client,
+        enqueue_strategy='all',
+        persist_state_key=persist_key,
+    )
+    request_manager = await sitemap_loader.to_tandem()
+
+    with patch.object(
+        request_manager._read_write_manager, 'add_request', side_effect=RuntimeError('transient write failure')
+    ):
+        # The migration fails, so the tandem hands nothing out and the loader keeps the request in flight.
+        assert await request_manager.fetch_next_request() is None
+        assert not await sitemap_loader.is_finished()
+        # The pending migration still counts as outstanding work, so the tandem is neither empty nor finished.
+        assert not await request_manager.is_empty()
+        assert not await request_manager.is_finished()
+
+    # Simulate an abrupt process interruption: the in-memory retry buffer is gone, but the loader's persisted
+    # state still owns the request because it was never marked handled.
+    await sitemap_loader.close()
+
+    restarted_loader = SitemapRequestLoader(
+        [str(sitemap_url)],
+        http_client=http_client,
+        enqueue_strategy='all',
+        persist_state_key=persist_key,
+    )
+    restarted_manager = await restarted_loader.to_tandem()
+
+    processed: list[str] = []
+    while not await restarted_manager.is_finished():
+        request = await restarted_manager.fetch_next_request()
+        if request:
+            processed.append(request.url)
+            await restarted_manager.mark_request_as_handled(request)
+
+    assert sorted(processed) == sorted(get_basic_results(server_url))
+    await restarted_loader.close()
+
+
+async def test_sitemap_loader_to_tandem_restart_does_not_duplicate_migrated_request(
+    server_url: URL,
+    http_client: HttpClient,
+) -> None:
+    """A request already stored in the target queue before the crash is not processed again after restart."""
+    sitemap_url = (server_url / 'sitemap.xml').with_query(
+        base64=encode_base64(get_basic_sitemap(url=server_url).encode())
+    )
+    persist_key = 'tandem_successful_migration_recovery'
+    queue_name = 'tandem-recovery-queue'
+
+    sitemap_loader = SitemapRequestLoader(
+        [str(sitemap_url)],
+        http_client=http_client,
+        enqueue_strategy='all',
+        persist_state_key=persist_key,
+    )
+    request_queue = await RequestQueue.open(name=queue_name)
+    request_manager = RequestManagerTandem(sitemap_loader, request_queue)
+
+    request = await request_manager.fetch_next_request()
+    assert request is not None
+    migrated_url = request.url
+    # The migration succeeded and the loader released the request, but processing (and thus marking handled)
+    # never happened because the process died here.
+    assert migrated_url not in sitemap_loader._state.current_value.in_progress
+    await sitemap_loader.close()
+
+    # Simulate a fresh process: drop the cached storage instances so the named queue is reopened from disk and
+    # reclaims its in-progress request, exactly as a real restart does.
+    service_locator.storage_instance_manager.clear_cache()
+
+    restarted_loader = SitemapRequestLoader(
+        [str(sitemap_url)],
+        http_client=http_client,
+        enqueue_strategy='all',
+        persist_state_key=persist_key,
+    )
+    restarted_queue = await RequestQueue.open(name=queue_name)
+    restarted_manager = RequestManagerTandem(restarted_loader, restarted_queue)
+
+    processed: list[str] = []
+    while not await restarted_manager.is_finished():
+        next_request = await restarted_manager.fetch_next_request()
+        if next_request:
+            processed.append(next_request.url)
+            await restarted_manager.mark_request_as_handled(next_request)
+
+    expected = get_basic_results(server_url)
+    assert sorted(processed) == sorted(expected)
+    assert processed.count(migrated_url) == 1
+    await restarted_loader.close()
+    await restarted_queue.drop()
 
 
 def _make_urlset(urls: list[str]) -> str:
