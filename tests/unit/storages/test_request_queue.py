@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -637,6 +638,252 @@ async def test_is_finished(rq: RequestQueue) -> None:
 
     # Now queue should be finished
     assert await rq.is_finished() is True
+
+
+async def test_add_requests_single_batch_creates_no_background_task(rq: RequestQueue) -> None:
+    """A submission that fits into one batch is fully written before `add_requests` returns."""
+    await rq.add_requests(['https://example.com/1', 'https://example.com/2'])
+
+    assert not rq._add_requests_tasks
+    assert await rq.get_total_count() == 2
+
+
+async def test_is_finished_raises_background_add_requests_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed background batch must surface via `is_finished` (exactly once) instead of being silently lost."""
+    rq = await RequestQueue.open(storage_client=MemoryStorageClient())
+    original_add_batch = rq._client.add_batch_of_requests
+    calls = 0
+
+    async def failing_add_batch(
+        requests: Sequence[Request],
+        *,
+        forefront: bool = False,
+    ) -> AddRequestsResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError('Storage unavailable')
+        return await original_add_batch(requests, forefront=forefront)
+
+    monkeypatch.setattr(rq._client, 'add_batch_of_requests', failing_add_batch)
+
+    try:
+        await rq.add_requests(
+            [f'https://example.com/{i}' for i in range(6)],
+            batch_size=2,
+            wait_time_between_batches=timedelta(0),
+            wait_for_all_requests_to_be_added=False,
+        )
+
+        # Wait for the background task to settle.
+        await poll_until_condition(lambda: not rq._add_requests_tasks)
+
+        # The failure of the second batch aborted the submission - the third batch was never attempted.
+        assert calls == 2
+        assert await rq.get_total_count() == 2
+
+        # `is_finished` raises the background failure instead of reporting the queue as finished...
+        with pytest.raises(RuntimeError, match='Storage unavailable'):
+            await rq.is_finished()
+
+        # ...and the failure is delivered exactly once.
+        assert await rq.is_finished() is False
+
+        # The requests that were written can still be processed to completion.
+        while (request := await rq.fetch_next_request()) is not None:
+            await rq.mark_request_as_handled(request)
+        assert await rq.is_finished() is True
+    finally:
+        await rq.drop()
+
+
+async def test_add_requests_wait_for_all_raises_background_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With `wait_for_all_requests_to_be_added=True` the background failure reaches the caller directly."""
+    rq = await RequestQueue.open(storage_client=MemoryStorageClient())
+    original_add_batch = rq._client.add_batch_of_requests
+    calls = 0
+
+    async def failing_add_batch(
+        requests: Sequence[Request],
+        *,
+        forefront: bool = False,
+    ) -> AddRequestsResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError('Storage unavailable')
+        return await original_add_batch(requests, forefront=forefront)
+
+    monkeypatch.setattr(rq._client, 'add_batch_of_requests', failing_add_batch)
+
+    try:
+        with pytest.raises(RuntimeError, match='Storage unavailable'):
+            await rq.add_requests(
+                [f'https://example.com/{i}' for i in range(6)],
+                batch_size=2,
+                wait_time_between_batches=timedelta(0),
+                wait_for_all_requests_to_be_added=True,
+            )
+
+        # The caller already observed the failure, so `is_finished` does not raise it again.
+        assert await rq.is_finished() is False
+    finally:
+        await rq.drop()
+
+
+async def test_add_requests_wait_timeout_cancels_background_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out wait cancels the background task, so no ownerless writes happen afterwards."""
+    rq = await RequestQueue.open(storage_client=MemoryStorageClient())
+    original_add_batch = rq._client.add_batch_of_requests
+    calls = 0
+
+    async def slow_background_add_batch(
+        requests: Sequence[Request],
+        *,
+        forefront: bool = False,
+    ) -> AddRequestsResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            await asyncio.sleep(30)
+        return await original_add_batch(requests, forefront=forefront)
+
+    monkeypatch.setattr(rq._client, 'add_batch_of_requests', slow_background_add_batch)
+
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await rq.add_requests(
+                [f'https://example.com/{i}' for i in range(4)],
+                batch_size=2,
+                wait_time_between_batches=timedelta(0),
+                wait_for_all_requests_to_be_added=True,
+                wait_for_all_requests_to_be_added_timeout=timedelta(milliseconds=100),
+            )
+
+        # The background task was cancelled - nothing is left running and nothing more is written.
+        assert not rq._add_requests_tasks
+        assert await rq.get_total_count() == 2
+        await asyncio.sleep(0.1)
+        assert await rq.get_total_count() == 2
+    finally:
+        await rq.drop()
+
+
+async def test_cancel_pending_add_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`cancel_pending_add_requests` stops background writes and leaves no pending tasks behind."""
+    rq = await RequestQueue.open(storage_client=MemoryStorageClient())
+    original_add_batch = rq._client.add_batch_of_requests
+    calls = 0
+
+    async def slow_background_add_batch(
+        requests: Sequence[Request],
+        *,
+        forefront: bool = False,
+    ) -> AddRequestsResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            await asyncio.sleep(30)
+        return await original_add_batch(requests, forefront=forefront)
+
+    monkeypatch.setattr(rq._client, 'add_batch_of_requests', slow_background_add_batch)
+
+    try:
+        await rq.add_requests(
+            [f'https://example.com/{i}' for i in range(6)],
+            batch_size=2,
+            wait_time_between_batches=timedelta(0),
+        )
+        assert rq._add_requests_tasks
+
+        await rq.cancel_pending_add_requests()
+
+        # Nothing is left running and the cancelled batches are never written.
+        assert not rq._add_requests_tasks
+        assert await rq.get_total_count() == 2
+        await asyncio.sleep(0.1)
+        assert await rq.get_total_count() == 2
+    finally:
+        await rq.drop()
+
+
+async def test_cancel_pending_add_requests_logs_unclaimed_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A background failure that no one observed is logged (and claimed) by `cancel_pending_add_requests`."""
+    rq = await RequestQueue.open(storage_client=MemoryStorageClient())
+    original_add_batch = rq._client.add_batch_of_requests
+    calls = 0
+
+    async def failing_add_batch(
+        requests: Sequence[Request],
+        *,
+        forefront: bool = False,
+    ) -> AddRequestsResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError('Storage unavailable')
+        return await original_add_batch(requests, forefront=forefront)
+
+    monkeypatch.setattr(rq._client, 'add_batch_of_requests', failing_add_batch)
+
+    try:
+        await rq.add_requests(
+            [f'https://example.com/{i}' for i in range(4)],
+            batch_size=2,
+            wait_time_between_batches=timedelta(0),
+        )
+        await poll_until_condition(lambda: not rq._add_requests_tasks)
+
+        with caplog.at_level(logging.ERROR, logger='crawlee.storages._request_queue'):
+            await rq.cancel_pending_add_requests()
+
+        assert 'some requests were not added to the queue' in caplog.text
+        assert 'Storage unavailable' in caplog.text
+
+        # The failure was claimed by the cancellation, so `is_finished` does not raise it again.
+        assert await rq.is_finished() is False
+    finally:
+        await rq.drop()
+
+
+async def test_drop_cancels_pending_add_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dropping the queue cancels pending background additions, so they cannot write into a dropped storage."""
+    rq = await RequestQueue.open(storage_client=MemoryStorageClient())
+    original_add_batch = rq._client.add_batch_of_requests
+    calls = 0
+
+    async def slow_background_add_batch(
+        requests: Sequence[Request],
+        *,
+        forefront: bool = False,
+    ) -> AddRequestsResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            await asyncio.sleep(30)
+        return await original_add_batch(requests, forefront=forefront)
+
+    monkeypatch.setattr(rq._client, 'add_batch_of_requests', slow_background_add_batch)
+
+    await rq.add_requests(
+        [f'https://example.com/{i}' for i in range(6)],
+        batch_size=2,
+        wait_time_between_batches=timedelta(0),
+    )
+    assert rq._add_requests_tasks
+
+    await rq.drop()
+
+    assert not rq._add_requests_tasks
 
 
 async def test_mark_non_existent_request_as_handled(rq: RequestQueue) -> None:

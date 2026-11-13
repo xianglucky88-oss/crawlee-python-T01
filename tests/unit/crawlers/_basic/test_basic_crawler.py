@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from crawlee._types import JsonSerializable
+    from crawlee.storage_clients.models import AddRequestsResponse
 
 
 async def test_processes_requests_from_explicit_queue() -> None:
@@ -191,6 +192,108 @@ async def test_failure_after_the_crawl_marks_the_run_as_failed(monkeypatch: pyte
     await queue.add_request('https://b.placeholder.com')
     await crawler.run()
     assert handled_urls == ['https://a.placeholder.com', 'https://b.placeholder.com']
+
+
+async def test_crawler_fails_when_background_add_requests_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed background batch must fail the run instead of the crawl finishing silently."""
+    queue = await RequestQueue.open(storage_client=MemoryStorageClient())
+    original_add_batch = queue._client.add_batch_of_requests
+    calls = 0
+
+    async def failing_background_add_batch(
+        requests: Sequence[Request], *, forefront: bool = False
+    ) -> AddRequestsResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError('Storage unavailable')
+        return await original_add_batch(requests, forefront=forefront)
+
+    monkeypatch.setattr(queue._client, 'add_batch_of_requests', failing_background_add_batch)
+
+    crawler = BasicCrawler(request_manager=queue)
+
+    @crawler.router.default_handler
+    async def handler(context: BasicCrawlingContext) -> None:
+        pass
+
+    # The first batch is written inline; the remaining batches go to a background task that fails.
+    await crawler.add_requests(
+        [f'https://{i}.placeholder.com' for i in range(6)],
+        batch_size=2,
+        wait_time_between_batches=timedelta(0),
+    )
+
+    with pytest.raises(RuntimeError, match='Storage unavailable'):
+        await crawler.run()
+
+
+async def test_crawler_fails_when_handler_enqueued_background_commit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A background failure while committing requests enqueued by a handler fails the run."""
+    queue = await RequestQueue.open(storage_client=MemoryStorageClient())
+    original_add_batch = queue._client.add_batch_of_requests
+    calls = 0
+
+    async def failing_background_add_batch(
+        requests: Sequence[Request], *, forefront: bool = False
+    ) -> AddRequestsResponse:
+        nonlocal calls
+        calls += 1
+        # Calls 1 (seed) and 2 (first commit batch, awaited) succeed; call 3 is the background batch.
+        if calls > 2:
+            raise RuntimeError('Storage unavailable')
+        return await original_add_batch(requests, forefront=forefront)
+
+    monkeypatch.setattr(queue._client, 'add_batch_of_requests', failing_background_add_batch)
+
+    crawler = BasicCrawler(request_manager=queue)
+
+    @crawler.router.default_handler
+    async def handler(context: BasicCrawlingContext) -> None:
+        if context.request.url.endswith('/seed'):
+            # Exceeds the default batch size of 1000, so the rest is committed by a background task.
+            await context.add_requests([f'https://{i}.placeholder.com' for i in range(1001)])
+
+    with pytest.raises(RuntimeError, match='Storage unavailable'):
+        await crawler.run(['https://placeholder.com/seed'])
+
+
+async def test_crawler_stop_cancels_pending_background_adds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the crawler shuts down, pending background additions are cancelled instead of outliving the run."""
+    queue = await RequestQueue.open(storage_client=MemoryStorageClient())
+    original_add_batch = queue._client.add_batch_of_requests
+    calls = 0
+
+    async def slow_background_add_batch(requests: Sequence[Request], *, forefront: bool = False) -> AddRequestsResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            await asyncio.sleep(30)
+        return await original_add_batch(requests, forefront=forefront)
+
+    monkeypatch.setattr(queue._client, 'add_batch_of_requests', slow_background_add_batch)
+
+    crawler = BasicCrawler(request_manager=queue)
+
+    @crawler.router.default_handler
+    async def handler(context: BasicCrawlingContext) -> None:
+        crawler.stop()
+
+    # The first batch is written inline; the remaining batches are stuck in a slow background task.
+    await crawler.add_requests(
+        [f'https://{i}.placeholder.com' for i in range(6)],
+        batch_size=2,
+        wait_time_between_batches=timedelta(0),
+    )
+    assert queue._add_requests_tasks
+
+    await crawler.run()
+
+    # The run is over - no background addition may still be pending or writing.
+    assert not queue._add_requests_tasks
+    assert await queue.get_total_count() == 2
 
 
 async def test_processes_requests_from_request_source_tandem() -> None:

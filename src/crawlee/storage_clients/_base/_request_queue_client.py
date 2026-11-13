@@ -47,6 +47,11 @@ class RequestQueueClient(ABC):
         This method adds a batch of requests to the queue. Each request is processed based on its uniqueness
         (determined by `unique_key`). Duplicates will be identified but not re-added to the queue.
 
+        Failure contract: requests that could not be stored should be reported via `unprocessed_requests`
+        in the response, so that the caller can retry them. Raising an exception instead (e.g. a storage-level
+        connection failure) aborts the whole submission - the caller treats it as a failure of the entire
+        batch and of any batches still queued behind it.
+
         Args:
             requests: The collection of requests to add to the queue.
             forefront: Whether to put the added requests at the beginning (True) or the end (False) of the queue.

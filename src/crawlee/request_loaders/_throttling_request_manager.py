@@ -241,6 +241,14 @@ class ThrottlingRequestManager(RequestManager, Generic[TRequestManager]):
             )
 
     @override
+    async def cancel_pending_add_requests(self) -> None:
+        # Only sub-managers that were already opened can have pending additions; do not open new ones here.
+        await asyncio.gather(
+            self._inner.cancel_pending_add_requests(),
+            *(sm.cancel_pending_add_requests() for sm in self._sub_managers.values()),
+        )
+
+    @override
     async def fetch_next_request(self) -> Request | None:
         """Fetch the next request, respecting per-domain delays.
 

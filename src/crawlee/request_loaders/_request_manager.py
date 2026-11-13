@@ -64,7 +64,10 @@ class RequestManager(RequestLoader, ABC):
             batch_size: The number of requests to add in one batch.
             wait_time_between_batches: Time to wait between adding batches.
             wait_for_all_requests_to_be_added: If True, wait for all requests to be added before returning.
+                Implementations that write later batches in the background raise storage-level failures
+                of those batches to the caller.
             wait_for_all_requests_to_be_added_timeout: Timeout for waiting for all requests to be added.
+                If the wait times out, the remaining background work is cancelled and `TimeoutError` is raised.
         """
         # Default and dumb implementation.
         processed_requests = list[ProcessedRequest]()
@@ -72,6 +75,13 @@ class RequestManager(RequestLoader, ABC):
             processed_request = await self.add_request(request, forefront=forefront)
             if processed_request:
                 processed_requests.append(processed_request)
+
+    async def cancel_pending_add_requests(self) -> None:
+        """Cancel background request additions that are still in progress and wait for them to stop.
+
+        Called when the owner of the manager is shutting down, so that no background writes outlive it.
+        The default implementation does nothing, as the base `add_requests` adds requests synchronously.
+        """
 
     @abstractmethod
     async def reclaim_request(self, request: Request, *, forefront: bool = False) -> ProcessedRequest | None:

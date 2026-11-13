@@ -815,6 +815,13 @@ class BasicCrawler(Generic[TCrawlingContext, TStatisticsState]):
         else:
             return final_statistics
         finally:
+            # Background request additions must not outlive the run - they would keep writing
+            # to the storage without an owner. Cancel whatever is still pending and wait for it.
+            if self._request_manager is not None:
+                try:
+                    await self._request_manager.cancel_pending_add_requests()
+                except Exception:
+                    self._logger.exception('Failed to cancel pending request additions at the end of the run.')
             # A failed run must leave the instance usable, so that the caller can retry after handling the error.
             self._running = False
 
@@ -870,7 +877,11 @@ class BasicCrawler(Generic[TCrawlingContext, TStatisticsState]):
             batch_size: The number of requests to add in one batch.
             wait_time_between_batches: Time to wait between adding batches.
             wait_for_all_requests_to_be_added: If True, wait for all requests to be added before returning.
+                Storage-level failures of background batches are raised to the caller. If False, a background
+                failure is instead raised by the request manager's `is_finished`, failing the crawl run rather
+                than letting it finish silently.
             wait_for_all_requests_to_be_added_timeout: Timeout for waiting for all requests to be added.
+                If the wait times out, the remaining background work is cancelled and `TimeoutError` is raised.
         """
         allowed_requests = []
         skipped = []

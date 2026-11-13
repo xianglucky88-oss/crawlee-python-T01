@@ -9,7 +9,6 @@ from typing_extensions import override
 
 from crawlee import Request, service_locator
 from crawlee._utils.docs import docs_group
-from crawlee._utils.wait import wait_for_all_tasks_to_finish
 from crawlee.request_loaders import RequestManager
 from crawlee.storage_clients.models import AddRequestsResponse
 
@@ -88,8 +87,15 @@ class RequestQueue(Storage, RequestManager):
         self._id = id
         self._name = name
 
-        self._add_requests_tasks = list[asyncio.Task]()
-        """A list of tasks for adding requests to the queue."""
+        self._add_requests_tasks = set[asyncio.Task[None]]()
+        """A set of tasks for adding requests to the queue."""
+
+        self._failed_add_requests_tasks = list[asyncio.Task[None]]()
+        """Background add requests tasks that failed and whose failure no consumer has claimed yet.
+
+        A failure is claimed (removed from this list) exactly once: by the `add_requests` caller waiting
+        for the submission, by `is_finished` raising it, or by `cancel_pending_add_requests` logging it.
+        """
 
     @property
     @override
@@ -143,6 +149,9 @@ class RequestQueue(Storage, RequestManager):
 
     @override
     async def drop(self) -> None:
+        # Cancel background additions first, so no pending task writes into the dropped storage afterwards.
+        await self.cancel_pending_add_requests()
+
         # Remove from cache before dropping
         storage_instance_manager = service_locator.storage_instance_manager
         storage_instance_manager.remove_from_cache(self)
@@ -151,6 +160,9 @@ class RequestQueue(Storage, RequestManager):
 
     @override
     async def purge(self) -> None:
+        # Cancel background additions first, so no pending task writes into the purged storage afterwards.
+        await self.cancel_pending_add_requests()
+
         try:
             await self._client.purge()
         except NotImplementedError:
@@ -208,6 +220,33 @@ class RequestQueue(Storage, RequestManager):
         wait_for_all_requests_to_be_added: bool = False,
         wait_for_all_requests_to_be_added_timeout: timedelta | None = None,
     ) -> None:
+        """Add requests to the queue in batches.
+
+        The first batch is written before this method returns. The remaining batches are written by a background
+        task, so that large submissions do not block the caller; `is_finished` reports the queue as not finished
+        while any background task is still in progress.
+
+        Failure semantics: requests that the storage client reports as unprocessed are retried (see
+        `_process_batch`) and skipped with a warning once the retries are exhausted. If a batch raises an
+        exception (a storage-level failure), the remaining batches are aborted and the failure is delivered
+        to exactly one consumer: the caller waiting with `wait_for_all_requests_to_be_added=True`, the next
+        `is_finished` call (which raises it instead of reporting the queue as finished), or
+        `cancel_pending_add_requests`.
+
+        Args:
+            requests: Requests to enqueue.
+            forefront: If True, add requests to the beginning of the queue.
+            batch_size: The number of requests to add in one batch.
+            wait_time_between_batches: Time to wait between adding batches.
+            wait_for_all_requests_to_be_added: If True, wait for all requests to be added before returning.
+                Storage-level failures of background batches are raised to the caller.
+            wait_for_all_requests_to_be_added_timeout: Timeout for waiting for all requests to be added.
+                If the wait times out, the background task is cancelled and `TimeoutError` is raised.
+
+        Raises:
+            TimeoutError: If `wait_for_all_requests_to_be_added_timeout` was reached before all requests
+                were added.
+        """
         transformed_requests = self._transform_requests(requests)
         wait_time_secs = wait_time_between_batches.total_seconds()
 
@@ -219,6 +258,10 @@ class RequestQueue(Storage, RequestManager):
                 base_retry_wait=wait_time_between_batches,
                 forefront=forefront,
             )
+
+        # If everything fit into the first batch, there is nothing left for a background task.
+        if len(transformed_requests) <= batch_size:
+            return
 
         async def _process_remaining_batches() -> None:
             for i in range(batch_size, len(transformed_requests), batch_size):
@@ -237,15 +280,66 @@ class RequestQueue(Storage, RequestManager):
             name='request_queue_process_remaining_batches_task',
         )
 
-        self._add_requests_tasks.append(remaining_batches_task)
-        remaining_batches_task.add_done_callback(lambda _: self._add_requests_tasks.remove(remaining_batches_task))
+        self._add_requests_tasks.add(remaining_batches_task)
+        remaining_batches_task.add_done_callback(self._on_add_requests_task_done)
 
-        # Wait for all tasks to finish if requested
+        # Wait for the background task to finish if requested. `asyncio.wait_for` cancels the task both when
+        # the timeout is reached and when the waiting coroutine itself is cancelled, so no ownerless task is
+        # left running in either case.
         if wait_for_all_requests_to_be_added:
-            await wait_for_all_tasks_to_finish(
-                (remaining_batches_task,),
-                logger=logger,
-                timeout=wait_for_all_requests_to_be_added_timeout,
+            try:
+                await asyncio.wait_for(
+                    remaining_batches_task,
+                    timeout=(
+                        wait_for_all_requests_to_be_added_timeout.total_seconds()
+                        if wait_for_all_requests_to_be_added_timeout is not None
+                        else None
+                    ),
+                )
+            finally:
+                # The caller observed the outcome of this submission, so claim its failure (if any) -
+                # it must not be reported again via `is_finished`.
+                self._claim_add_requests_task(remaining_batches_task)
+
+    def _on_add_requests_task_done(self, task: asyncio.Task[None]) -> None:
+        """Handle the completion of a background add requests task.
+
+        A failed task is recorded so that its exception is delivered to exactly one consumer instead of
+        being silently lost. Cancelled tasks are an intended outcome of shutdown and are not recorded.
+        """
+        self._add_requests_tasks.discard(task)
+
+        if task.cancelled():
+            return
+
+        if task.exception() is not None:
+            logger.debug('A background add requests task failed.', exc_info=task.exception())
+            self._failed_add_requests_tasks.append(task)
+
+    def _claim_add_requests_task(self, task: asyncio.Task[None]) -> None:
+        """Mark the failure of the given task as consumed, so that it is not reported again."""
+        if task in self._failed_add_requests_tasks:
+            self._failed_add_requests_tasks.remove(task)
+
+    @override
+    async def cancel_pending_add_requests(self) -> None:
+        pending_tasks = list(self._add_requests_tasks)
+
+        for task in pending_tasks:
+            task.cancel()
+
+        if pending_tasks:
+            # Wait for the cancellations to settle, so no task keeps writing after this method returns.
+            # Task failures are already recorded in `_failed_add_requests_tasks` by the done callback,
+            # so they are handled (and logged) below rather than re-raised here.
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        # Claim and log failures that no other consumer has observed, so they are not silently lost.
+        while self._failed_add_requests_tasks:
+            failed_task = self._failed_add_requests_tasks.pop(0)
+            logger.error(
+                'A background add requests task failed; some requests were not added to the queue.',
+                exc_info=failed_task.exception(),
             )
 
     async def fetch_next_request(self) -> Request | None:
@@ -331,12 +425,26 @@ class RequestQueue(Storage, RequestManager):
         A finished queue means that all requests have been processed and there are no more tasks that could add
         additional requests to the queue. This is the definitive way to check if a crawling operation is complete.
 
+        If a background batch of a previous `add_requests` call failed and no consumer has observed the failure
+        yet, the stored exception is raised (once) instead of reporting the queue as finished - the failed
+        submission means some requests were never written, so the queue must not be considered complete.
+
         Returns:
             True if the request queue is finished and no pending add operations, False otherwise.
+
+        Raises:
+            Exception: The exception a background `add_requests` task failed with, if it has not been
+                observed yet.
         """
         if self._add_requests_tasks:
             logger.debug('Background add requests tasks are still in progress.')
             return False
+
+        if self._failed_add_requests_tasks:
+            # Only tasks that failed with an exception are recorded, so the first pop always yields one.
+            failed_task = self._failed_add_requests_tasks.pop(0)
+            if (error := failed_task.exception()) is not None:
+                raise error
 
         if await self._client.is_finished():
             logger.debug('The request queue is finished.')
